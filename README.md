@@ -41,10 +41,13 @@ To support the situation, the concept of halo is provided. Halo is an area, wher
 
 ### 4.1 Hello world
 
-(this example comes from [distributed-ranges repo](https://github.com/oneapi-src/distributed-ranges/)
+The first program presents declaration of *distributed_vector<>* and reveals its distribution over MPI nodes.
+It uses dr::mhp namespace and requires MPI to be installed in the target environment.
+The example should be run with mpirun -n *N* ./hello_world, where *N* is a number of your MPI processes.
+
+This example comes from [distributed-ranges repo](https://github.com/oneapi-src/distributed-ranges/)
 from the file ./examples/mhp/hello_world.cpp
 
-The first program presents declaration of distributed_vector<> and reveals its distribution over MPI nodes.
 
     // SPDX-FileCopyrightText: Intel Corporation
     //
@@ -62,32 +65,32 @@ The first program presents declaration of distributed_vector<> and reveals its d
       mhp::init();
     #endif
 
-    {
-      fmt::print("Hello, World! Distributed ranges is running on rank {} / {} on host {}\n",
-                  mhp::rank(), mhp::nprocs(), mhp::hostname());
+        {   
+            fmt::print("Hello, World! Distributed ranges is running on rank {} / {} on host {}\n",
+                        mhp::rank(), mhp::nprocs(), mhp::hostname());
 
-      std::size_t n = 1000;
-    
-      mhp::distributed_vector<int> v(n);
- 
-      if (mhp::rank() == 0) {
-        auto &&segments = v.segments();
- 
-        fmt::print("Created distributed_vector of size {} with {} segments.\n",
-                  v.size(), segments.size());
+            std::size_t n = 1000;
 
-        std::size_t segment_id = 0;
-        for (auto &&segment : segments) {
-          fmt::print("Rank {} owns segment {}, which is size {}\n",
-                     dr::ranges::rank(segment), segment_id, segment.size());
-          ++segment_id;
+            mhp::distributed_vector<int> v(n);
+
+            if (mhp::rank() == 0) {
+                auto &&segments = v.segments();
+
+                fmt::print("Created distributed_vector of size {} with {} segments.\n",
+                            v.size(), segments.size());
+
+                std::size_t segment_id = 0;
+                for (auto &&segment : segments) {
+                    fmt::print("Rank {} owns segment {}, which is size {}\n",
+                                dr::ranges::rank(segment), segment_id, segment.size());
+                    ++segment_id;
+                }
+            }
         }
-      }
-   }
 
-   mhp::finalize();
-   return 0;
- }
+        mhp::finalize();
+        return 0;
+    }
 
 ### 4.2 Elementary cellular automaton (TBD)
 
