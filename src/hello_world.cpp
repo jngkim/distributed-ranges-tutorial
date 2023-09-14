@@ -16,14 +16,9 @@ int main(int argc, char **argv) {
 
   {
 
-    // fmt::print("Hello, World! Distributed ranges is running on rank {} / {}
-    // on "
-    //            "host {}\n",
-    //            mhp::rank(), mhp::nprocs(), mhp::hostname());
-
-    std::cout << "Hello, World! Distributed ranges is running on rank "
-              << mhp::rank() << "/" << mhp::nprocs() << " host "
-              << mhp::hostname() << std::endl;
+    fmt::print("Hello, World! Distributed ranges is running on rank {} / {} on "
+               "host {}\n",
+               mhp::rank(), mhp::nprocs(), mhp::hostname());
 
     std::size_t n = 1000;
 
@@ -32,17 +27,13 @@ int main(int argc, char **argv) {
     if (mhp::rank() == 0) {
       auto &&segments = v.segments();
 
-      // fmt::print("Created distributed_vector of size {} with {} segments.\n",
-      //            v.size(), segments.size());
-      std::cout << "Created distributed_vector of size " << v.size() << " with "
-                << segments.size() << std::endl;
+      fmt::print("Created distributed_vector of size {} with {} segments.\n",
+                 v.size(), segments.size());
 
       std::size_t segment_id = 0;
       for (auto &&segment : segments) {
-        // fmt::print("Rank {} owns segment {}, which is size {}\n",
-        //            dr::ranges::rank(segment), segment_id, segment.size());
-        std::cout << "Rank " << dr::ranges::rank(segment) << " owns segment "
-                  << segment_id << ", which is size " << segment.size() << "\n";
+        fmt::print("Rank {} owns segment {}, which is size {}\n",
+                   dr::ranges::rank(segment), segment_id, segment.size());
         ++segment_id;
       }
     }
