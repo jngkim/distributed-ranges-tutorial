@@ -60,7 +60,7 @@ int main(int argc, char **argv) {
     dr::mhp::halo(in).exchange();
 
     /* the proper loop calculating new values of automaton's cells */
-    mhp::for_each(mhp::views::zip(in, out), set_cell);
+    mhp::for_each(mhp::views::zip(in, out), newvalue);
 
     /* swap input and output vectors, to keep automaton state always in the same
      * variable */
