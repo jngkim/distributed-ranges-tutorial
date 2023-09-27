@@ -8,11 +8,8 @@
 namespace mhp = dr::mhp;
 
 int main(int argc, char **argv) {
-#ifdef SYCL_LANGUAGE_VERSION
+
   mhp::init(sycl::default_selector_v);
-#else
-  mhp::init();
-#endif
 
   mhp::distributed_vector<char> dv(81);
   std::string decoded_string(80, 0);
