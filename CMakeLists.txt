@@ -14,6 +14,7 @@ project(
 find_package(MPI REQUIRED)
 
 add_subdirectory(src)
+add_subdirectory(src/shp)
 
 #required by distributed-ranges
 option(ENABLE_FORMAT "Build with format library" ON)
@@ -31,3 +32,9 @@ FetchContent_Declare(
   GIT_REPOSITORY https://github.com/fmtlib/fmt.git
   GIT_TAG 0b0f7cf)
 FetchContent_MakeAvailable(cpp-format)
+
+FetchContent_Declare(
+  cxxopts
+  GIT_REPOSITORY https://github.com/jarro2783/cxxopts.git
+  GIT_TAG v3.0.0)
+FetchContent_MakeAvailable(cxxopts)
