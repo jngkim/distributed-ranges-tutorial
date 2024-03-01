@@ -55,70 +55,11 @@ void init_matrix_3d(dr::shp::distributed_dense_matrix<std::complex<T>> &m,
   });
 }
 
-template <typename T1, typename T2>
-sycl::event transpose_tile(std::size_t m, std::size_t n, T1 in, std::size_t lda,
-                           T2 out, std::size_t ldb,
-                           const std::vector<sycl::event> &events = {}) {
-  auto &&q = dr::shp::__detail::get_queue_for_pointer(out);
-  constexpr std::size_t tile_size = 16;
-  const std::size_t m_max = ((m + tile_size - 1) / tile_size) * tile_size;
-  const std::size_t n_max = ((n + tile_size - 1) / tile_size) * tile_size;
-  using temp_t = std::iter_value_t<T1>;
-  const auto in_ = in.get_raw_pointer();
-
-  return q.submit([&](sycl::handler &cgh) {
-    cgh.depends_on(events);
-    sycl::local_accessor<temp_t, 2> tile(
-        sycl::range<2>(tile_size, tile_size + 1), cgh);
-
-    cgh.parallel_for(sycl::nd_range<2>{{m_max, n_max}, {tile_size, tile_size}},
-                     [=](sycl::nd_item<2> item) {
-                       unsigned x = item.get_global_id(1);
-                       unsigned y = item.get_global_id(0);
-                       unsigned xth = item.get_local_id(1);
-                       unsigned yth = item.get_local_id(0);
-
-                       if (x < n && y < m)
-                         tile[yth][xth] = in_[(y)*lda + x];
-                       item.barrier(sycl::access::fence_space::local_space);
-
-                       x = item.get_group(0) * tile_size + xth;
-                       y = item.get_group(1) * tile_size + yth;
-                       if (x < m && y < n)
-                         out[(y)*ldb + x] = tile[xth][yth];
-                     });
-  });
-}
-
-
-template <typename T>
-void transpose_matrix(dr::shp::distributed_dense_matrix<T> &i_mat,
-                      dr::shp::distributed_dense_matrix<T> &o_mat) {
-  std::vector<sycl::event> events;
-  int ntiles = i_mat.segments().size();
-  int lda = i_mat.shape()[1];
-  int ldb = o_mat.shape()[1];
-  // need to handle offsets better
-  int m_local = i_mat.shape()[0] / ntiles;
-  int n_local = o_mat.shape()[0] / ntiles;
-  for (int i = 0; i < ntiles; i++) {
-    for (int j_ = 0; j_ < ntiles; j_++) {
-      int j = (j_ + i) % ntiles;
-      auto &&send_tile = i_mat.tile({i, 0});
-      auto &&recv_tile = o_mat.tile({j, 0});
-      auto e = transpose_tile(m_local, n_local, send_tile.data() + j * n_local,
-                              lda, recv_tile.data() + i * m_local, ldb);
-      events.push_back(e);
-    }
-  }
-  sycl::event::wait(events);
-}
-
-sycl::event mkl_dft(auto aplan_, auto data_, bool forward) {
+sycl::event mkl_dft(auto aplan_, auto data_, bool forward, const std::vector<sycl::event>& events = {}) {
   if (forward) {
-    return oneapi::mkl::dft::compute_forward(*aplan_, data_);
+    return oneapi::mkl::dft::compute_forward(*aplan_, data_, events);
   }
-  return oneapi::mkl::dft::compute_backward(*aplan_, data_);
+  return oneapi::mkl::dft::compute_backward(*aplan_, data_, events);
 }
 
 template <typename T> struct dft_precision {
@@ -161,23 +102,10 @@ template <typename T> class distributed_fft {
 
 #pragma omp barrier
 
-        int lda = i_mat.shape()[1];
-        int ldb = o_mat.shape()[1];
-        int m_local = i_mat.shape()[0] / ntiles;
-        int n_local = o_mat.shape()[0] / ntiles;
-
-        std::vector<sycl::event> events;
-        for (int j_ = 0; j_ < ntiles; j_++) {
-          int j = (j_ + i) % ntiles;
-          auto &&recv_tile = o_mat.tile({j, 0});
-          auto e = transpose_tile(m_local, n_local, atile.data() + j * n_local,
-                                  lda, recv_tile.data() + i * m_local, ldb);
-          events.push_back(e);
-        }
-        sycl::event::wait(events);
-
         auto &&btile = o_mat.tile({i, 0});
-        mkl_dft(plan_1, dr::shp::__detail::local(btile).data(), forward).wait();
+        auto &&q = dr::shp::__detail::queue(i);
+        auto e = q.memcpy(dr::shp::__detail::local(btile).data(), dr::shp::__detail::local(atile).data(), atile.size()*sizeof(std::complex<T>));
+        mkl_dft(plan_1, dr::shp::__detail::local(btile).data(), forward, {e}).wait();
     }
   }
 
@@ -202,23 +130,10 @@ template <typename T> class distributed_fft {
 
         fft_phase_done.arrive_and_wait();
 
-        int lda = i_mat.shape()[1];
-        int ldb = o_mat.shape()[1];
-        int m_local = i_mat.shape()[0] / ntiles;
-        int n_local = o_mat.shape()[0] / ntiles;
-
-        std::vector<sycl::event> events;
-        for (int j_ = 0; j_ < ntiles; j_++) {
-          int j = (j_ + i) % ntiles;
-          auto &&recv_tile = o_mat.tile({j, 0});
-          auto e = transpose_tile(m_local, n_local, atile.data() + j * n_local,
-                                  lda, recv_tile.data() + i * m_local, ldb);
-          events.push_back(e);
-        }
-        sycl::event::wait(events);
-
         auto &&btile = o_mat.tile({i, 0});
-        mkl_dft(plan_1, dr::shp::__detail::local(btile).data(), forward).wait();
+        auto &&q = dr::shp::__detail::queue(i);
+        auto e = q.memcpy(dr::shp::__detail::local(btile).data(), dr::shp::__detail::local(atile).data(), atile.size()*sizeof(std::complex<T>));
+        mkl_dft(plan_1, dr::shp::__detail::local(btile).data(), forward, {e}).wait();
       });
     }
   }
@@ -242,7 +157,15 @@ template <typename T> class distributed_fft {
     sycl::event::wait(events);
     events.clear();
 
-    transpose_matrix(i_mat, o_mat);
+    for (int i = 0; i < nprocs; i++) {
+      auto &&q = dr::shp::__detail::queue(i);
+      auto &&atile = i_mat.tile({i, 0});
+      auto &&btile = o_mat.tile({i, 0});
+      auto e = q.memcpy(dr::shp::__detail::local(btile).data(), dr::shp::__detail::local(atile).data(), atile.size()*sizeof(std::complex<T>));
+      events.push_back(e);
+    }
+    sycl::event::wait(events);
+    events.clear();
 
     for (int i = 0; i < nprocs; i++) {
       auto &&atile = o_mat.tile({i, 0});
@@ -313,41 +236,6 @@ public:
     }
   }
 
-  void check() {
-    fmt::print("Testing\n");
-    dr::shp::distributed_dense_matrix<value_t> t_mat({m_, n_}, row_blocks_);
-
-    fft_threads(in_, out_, true);
-    fft_threads(out_, t_mat, false);
-
-    fmt::print("Checking results\n");
-    auto sub_view = dr::shp::views::zip(values_view(in_), values_view(t_mat)) |
-                    dr::shp::views::transform([](auto &&e) {
-                      auto &&[value, ref] = e;
-                      return value - ref;
-                    });
-    auto diff_sum = dr::shp::reduce(dr::shp::par_unseq, sub_view, value_t{});
-    fmt::print("Difference {} {} \n", diff_sum.real(), diff_sum.imag());
-  }
-
-  void show_plan(const std::string &title, auto *plan) {
-    MKL_LONG transforms, fwd_distance, bwd_distance;
-    real_t forward_scale, backward_scale;
-    plan->get_value(oneapi::mkl::dft::config_param::NUMBER_OF_TRANSFORMS,
-                    &transforms);
-    plan->get_value(oneapi::mkl::dft::config_param::FWD_DISTANCE,
-                    &fwd_distance);
-    plan->get_value(oneapi::mkl::dft::config_param::BWD_DISTANCE,
-                    &bwd_distance);
-    plan->get_value(oneapi::mkl::dft::config_param::FORWARD_SCALE,
-                    &forward_scale);
-    plan->get_value(oneapi::mkl::dft::config_param::BACKWARD_SCALE,
-                    &backward_scale);
-    fmt::print("{}:\n  number of transforms: {}\n  fwd distance: {}\n  bwd "
-               "distance: {}\n  forward scale: {}\n  backward scale: {}\n",
-               title, transforms, fwd_distance, bwd_distance, forward_scale,
-               backward_scale);
-  }
 };
 
 #ifdef STANDALONE_BENCHMARK
@@ -403,9 +291,7 @@ int main(int argc, char *argv[]) {
   dim = (dim + ranks-1) / ranks * ranks;
   distributed_fft<real_t> fft3d(dim);
 
-  if (nreps == 0) {
-    fft3d.check();
-  } else {
+  {
     fft3d.compute(p_mode);
     double elapsed = 0;
     for (int iter = 0; iter < nreps; ++iter) {
@@ -418,8 +304,8 @@ int main(int argc, char *argv[]) {
 
     std::size_t volume = dim * dim * dim;
     std::size_t fft_flops =  2 * static_cast<std::size_t>(5. * volume * std::log2(static_cast<double>(volume)));
-    double t_avg = elapsed / (nreps - 1);
-    fmt::print("fft3d-shp-{3} {0} {4} AvgTime {1:.3f} GFLOPS {2:.3f}\n", dim, t_avg, fft_flops/t_avg*1e-9, p_mode, ranks);
+    double t_avg = (nreps>1)? elapsed / (nreps - 1): 1e-9;
+    fmt::print("fft3d-memcpy-{3} {0} {4} AvgTime {1:.3f} GFLOPS {2:.3f}\n", dim, t_avg, fft_flops/t_avg*1e-9, p_mode, ranks);
 
   }
 

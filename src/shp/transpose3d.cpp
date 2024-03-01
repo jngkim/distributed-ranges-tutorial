@@ -29,6 +29,15 @@ void init_matrix_3d(dr::shp::distributed_dense_matrix<T> &m) {
 }
 
 template <typename T>
+void init_matrix_3d_T(dr::shp::distributed_dense_matrix<T> &m) {
+  std::size_t lda = m.shape()[0];
+  dr::shp::for_each(dr::shp::par_unseq, m, [=](auto &&entry) {
+    auto &&[idx, v] = entry;
+    v = idx[1]*lda + idx[0];
+  });
+}
+
+template <typename T>
 void init_matrix_3d(dr::shp::distributed_dense_matrix<std::complex<T>> &m) {
   std::size_t lda = m.shape()[1];
   dr::shp::for_each(dr::shp::par_unseq, m, [=](auto &&entry) {
@@ -38,16 +47,27 @@ void init_matrix_3d(dr::shp::distributed_dense_matrix<std::complex<T>> &m) {
 }
 
 template <typename T1, typename T2>
-sycl::event transpose_tile(std::size_t m, std::size_t n, T1 in, std::size_t lda,
-                           T2 out, std::size_t ldb,
-                           const std::vector<sycl::event> &events = {}) {
-  auto &&q = dr::shp::__detail::get_queue_for_pointer(out);
+sycl::event transpose_tile(sycl::queue& q, std::size_t m, std::size_t n, 
+    T1 in, std::size_t lda,
+    T2 out, std::size_t ldb,
+    const std::vector<sycl::event> &events = {}) {
+  //auto &&q = dr::shp::__detail::get_queue_for_pointer(out);
   constexpr std::size_t tile_size = 16;
   const std::size_t m_max = ((m + tile_size - 1) / tile_size) * tile_size;
   const std::size_t n_max = ((n + tile_size - 1) / tile_size) * tile_size;
   using temp_t = std::iter_value_t<T1>;
   const auto in_ = in.get_raw_pointer();
 
+#if 0
+  //write coalsed
+  return q.parallel_for(sycl::nd_range<2>{{n_max, m_max}, {tile_size, tile_size}}, events,
+      [=](sycl::nd_item<2> item) {
+      auto x   = item.get_global_id(0);
+      auto y   = item.get_global_id(1);
+      if (x < n && y < m)
+        out[x*ldb+y] = in_[y*lda+x];
+    });
+#else
   return q.submit([&](sycl::handler &cgh) {
     cgh.depends_on(events);
     sycl::local_accessor<temp_t, 2> tile(
@@ -70,14 +90,16 @@ sycl::event transpose_tile(std::size_t m, std::size_t n, T1 in, std::size_t lda,
                          out[(y)*ldb + x] = tile[xth][yth];
                      });
   });
+#endif
 }
 
 template<typename T1, typename T2>
-sycl::event pack_tiles(size_t m, size_t n,
-                       T1 in,  size_t lda, T2 out, size_t ldb,
+sycl::event pack_tiles(sycl::queue& q, size_t m, size_t n,
+                       T1 in,  size_t lda, 
+                       T2 out, size_t ldb,
                        const std::vector<sycl::event>& events = {})
 {
-  auto &&q = dr::shp::__detail::get_queue_for_pointer(out);
+  //auto &&q = dr::shp::__detail::get_queue_for_pointer(out);
   constexpr size_t tile_size = 16;
   const size_t m_max         = ((m + tile_size - 1) / tile_size) * tile_size;
   const size_t n_max         = ((n + tile_size - 1) / tile_size) * tile_size;
@@ -115,19 +137,33 @@ struct TransposeBase {
                          dr::shp::distributed_dense_matrix<T> &o_mat) = 0;
 
   void check() { 
+    dr::shp::distributed_dense_matrix<T> t_mat({n_, m_}, row_blocks_);
+    init_matrix_3d_T(t_mat);
     transpose(in_, out_);
-    for (std::size_t i = 0; i < m_; i++)
-    {
-      for (std::size_t j = 0; j < m_; j++)
+
+    fmt::print("Checking results\n");
+    if(m_ < 17) {
+      for (std::size_t i = 0; i < m_; i++)
       {
-        for (std::size_t k = 0; k < m_; k++)
-          if(out_[{i * m_ + j , k}] != (i * m_ + j + k * m_ * m_)) 
-            fmt::print("Error {} {} {}\n", i, j, k, out_[{i * m_ + j , k}]);
-        //fmt::print("\n");
+        for (std::size_t j = 0; j < m_; j++)
+        {
+          for (std::size_t k = 0; k < m_; k++)
+            fmt::print("{} ", t_mat[{i * m_ + j , k}]);
+          fmt::print("\n");
+        }
+        fmt::print("\n");
       }
-      //fmt::print("\n");
     }
+
+    auto sub_view = dr::shp::views::zip(values_view(out_), values_view(t_mat)) |
+                    dr::shp::views::transform([](auto &&e) {
+                      auto &&[value, ref] = e;
+                      return value - ref;
+                    });
+    auto diff_sum = dr::shp::reduce(dr::shp::par_unseq, sub_view, T{});
+    fmt::print("Difference {} \n", diff_sum);
   }
+
   void compute() { 
     transpose(in_, out_);
   }
@@ -152,9 +188,39 @@ struct TransposeSerial: TransposeBase<T> {
         int j = (j_ + i) % ntiles;
         auto &&send_tile = i_mat.tile({i, 0});
         auto &&recv_tile = o_mat.tile({j, 0});
-        auto e = transpose_tile(m_local, n_local, send_tile.data() + j * n_local,
+        auto e = transpose_tile(dr::shp::__detail::queue(j), 
+            m_local, n_local, send_tile.data() + j * n_local,
             lda, recv_tile.data() + i * m_local, ldb);
-        events.push_back(e);
+        events.emplace_back(e);
+      }
+    }
+    sycl::event::wait(events);
+  }
+};
+
+template<typename T>
+struct TransposePutSerial: TransposeBase<T> {
+
+  explicit TransposePutSerial(std::int64_t m_in): TransposeBase<T>(m_in){}
+
+  void transpose(dr::shp::distributed_dense_matrix<T> &i_mat,
+                 dr::shp::distributed_dense_matrix<T> &o_mat) override {
+    std::vector<sycl::event> events;
+    int ntiles = i_mat.segments().size();
+    int lda = i_mat.shape()[1];
+    int ldb = o_mat.shape()[1];
+    // need to handle offsets better
+    int m_local = i_mat.shape()[0] / ntiles;
+    int n_local = o_mat.shape()[0] / ntiles;
+    for (int i = 0; i < ntiles; i++) {
+      for (int j_ = 0; j_ < ntiles; j_++) {
+        int j = (j_ + i) % ntiles;
+        auto &&send_tile = i_mat.tile({i, 0});
+        auto &&recv_tile = o_mat.tile({j, 0});
+        auto e = transpose_tile(dr::shp::__detail::queue(i), 
+            m_local, n_local, send_tile.data() + j * n_local,
+            lda, recv_tile.data() + i * m_local, ldb);
+        events.emplace_back(e);
       }
     }
     sycl::event::wait(events);
@@ -183,9 +249,10 @@ struct TransposeThreads: TransposeBase<T> {
         for (int j_ = 0; j_ < ntiles; j_++) {
           int j = (j_ + i) % ntiles;
           auto &&recv_tile = o_mat.tile({j, 0});
-          auto e = transpose_tile(m_local, n_local, atile.data() + j * n_local,
-                                  lda, recv_tile.data() + i * m_local, ldb);
-          events.push_back(e);
+          auto e = transpose_tile(dr::shp::__detail::queue(j), m_local, n_local, 
+              atile.data() + j * n_local, lda, 
+              recv_tile.data() + i * m_local, ldb);
+          events.emplace_back(e);
         }
         sycl::event::wait(events);
       });
@@ -200,6 +267,7 @@ struct TransposeAll2AllThreads: TransposeBase<T> {
 
   void transpose(dr::shp::distributed_dense_matrix<T> &i_mat,
                  dr::shp::distributed_dense_matrix<T> &o_mat) override {
+
     int ntiles = i_mat.segments().size();
     std::vector<std::jthread> threads;
     std::latch all2all_ready(ntiles);
@@ -219,12 +287,13 @@ struct TransposeAll2AllThreads: TransposeBase<T> {
           auto &&packed_tile = o_mat.tile({i, 0});
           for (std::size_t j_ = 0; j_ < ntiles; j_++) {
             std::size_t j = (j_ + i) % std::size_t(ntiles);
-            auto e = pack_tiles(m_local, n_local, atile.data() + j * n_local, lda, packed_tile.data() + j * block_size, n_local);
-            events.push_back(e);
+            auto e = pack_tiles(dr::shp::__detail::queue(i), m_local, n_local, 
+                atile.data() + j * n_local, lda, 
+                packed_tile.data() + j * block_size, n_local);
+            events.emplace_back(e);
           }
         }
         sycl::event::wait(events);
-        all2all_ready.arrive_and_wait();
 
         events.clear();
         //copy Out_i(j,blocksize) -> remote In_j(i, blocksize)
@@ -234,24 +303,94 @@ struct TransposeAll2AllThreads: TransposeBase<T> {
           auto &&recv_tile = i_mat.tile({j, 0});
           auto e = dr::shp::copy_async(send_tile.data() + j*block_size, send_tile.data() + (j+1)*block_size, 
                                        recv_tile.data() + i*block_size);
-          events.push_back(e);
+          events.emplace_back(e);
         }
         sycl::event::wait(events);
         events.clear();
+
+        all2all_ready.arrive_and_wait();
 
         //unpack (transpose) In(nproc,blocksize) -> Out(n_local, ldb)
         auto &&btile = o_mat.tile({i, 0}); // local tile (n_local, ldb)
         auto &&unpacked_tile = i_mat.tile({i, 0});
         for (std::size_t j_ = 0; j_ < ntiles; j_++) {
           std::size_t j = (j_ + i) % std::size_t(ntiles);
-          auto e = transpose_tile(m_local, n_local, unpacked_tile.data() + j * block_size, n_local, btile.data() + j * m_local, ldb);
-          events.push_back(e);
+          auto e = transpose_tile(dr::shp::__detail::queue(i), m_local, n_local, 
+              unpacked_tile.data() + j * block_size, n_local, 
+              btile.data() + j * m_local, ldb);
+          events.emplace_back(e);
         }
         sycl::event::wait(events);
       });
     }
   }
 };
+
+template<typename T>
+struct TransposeAll2AllOMP: TransposeBase<T> {
+
+  explicit TransposeAll2AllOMP(std::int64_t m_in): TransposeBase<T>(m_in){}
+
+  void transpose(dr::shp::distributed_dense_matrix<T> &i_mat,
+                 dr::shp::distributed_dense_matrix<T> &o_mat) override {
+#pragma omp parallel
+    {
+      int i = omp_get_thread_num();
+      int nprocs = i_mat.segments().size();
+      int lda = i_mat.shape()[1];
+      int ldb = o_mat.shape()[1];
+      int m_local = i_mat.shape()[0] / nprocs;
+      int n_local = o_mat.shape()[0] / nprocs;
+
+      auto &&atile = i_mat.tile({i, 0}); // local tile (m_local, lda)
+
+      const size_t block_size = m_local * n_local;
+      //pack In(m_local, lda) -> Out(nproc, m_local*n_local)
+      std::vector<sycl::event> events;
+      {
+        auto &&packed_tile = o_mat.tile({i, 0});
+        for (std::size_t j_ = 0; j_ < nprocs; j_++)
+        {
+          std::size_t j = (j_ + i) % std::size_t(nprocs);
+          auto e = pack_tiles(dr::shp::__detail::queue(i), m_local, n_local, 
+              atile.data() + j * n_local, lda, 
+              packed_tile.data() + j * block_size, n_local);
+          events.emplace_back(e);
+        }
+      }
+      sycl::event::wait(events);
+      events.clear();
+
+      //copy Out_i(j,blocksize) -> remote In_j(i, blocksize)
+      for (std::size_t j_ = 0; j_ < nprocs; j_++)
+      {
+        std::size_t j = (j_ + i) % std::size_t(nprocs);
+        auto &&send_tile = o_mat.tile({i, 0});
+        auto &&recv_tile = i_mat.tile({j, 0});
+        auto e = dr::shp::copy_async(send_tile.data() + j*block_size, send_tile.data() + (j+1)*block_size, 
+            recv_tile.data() + i*block_size);
+        events.emplace_back(e);
+      }
+      sycl::event::wait(events);
+      events.clear();
+
+#pragma omp barrier
+      //unpack (transpose) In(nproc,blocksize) -> Out(n_local, ldb)
+      auto &&btile = o_mat.tile({i, 0}); // local tile (n_local, ldb)
+      for (std::size_t j_ = 0; j_ < nprocs; j_++)
+      {
+        std::size_t j = (j_ + i) % std::size_t(nprocs);
+        auto &&unpacked_tile = i_mat.tile({i, 0});
+          auto e = transpose_tile(dr::shp::__detail::queue(j), m_local, n_local, 
+              unpacked_tile.data() + j * block_size, n_local, 
+              btile.data() + j * m_local, ldb);
+        events.emplace_back(e);
+      }
+      sycl::event::wait(events);
+    }
+  }
+};
+
 
 
 int main(int argc, char *argv[]) {
@@ -261,6 +400,7 @@ int main(int argc, char *argv[]) {
   options_spec.add_options()
     ("d, num-devices", "number of sycl devices, 0 uses all available devices", cxxopts::value<std::size_t>()->default_value("0"))
     ("n", "problem size", cxxopts::value<std::size_t>()->default_value("8"))
+    ("p, parallel", "host 0:serial, 1:threads, 2:openmp", cxxopts::value<int>()->default_value("0"))
     ("r,repetitions", "Number of repetitions", cxxopts::value<std::size_t>()->default_value("0"))
     ("log", "enable logging")
     ("logprefix", "appended .RANK.log", cxxopts::value<std::string>()->default_value("dr"))
@@ -287,6 +427,8 @@ int main(int argc, char *argv[]) {
   std::size_t dim = options["n"].as<std::size_t>();
   std::size_t nreps = options["repetitions"].as<std::size_t>();
 
+  int p_mode = options["p"].as<int>();
+
   auto devices = dr::shp::get_numa_devices(sycl::default_selector_v);
   std::size_t ranks = options["num-devices"].as<std::size_t>();
   if (ranks != 0 && ranks < devices.size()) {
@@ -297,33 +439,49 @@ int main(int argc, char *argv[]) {
   //}
   dr::shp::init(devices);
 
-  omp_set_num_threads(devices.size());
-
   dim = (dim + ranks-1) / ranks * ranks;
 
   using real_t = float;
-  //using value_t = std::complex<real_t>;
   using value_t = real_t;
 
+  std::string tag;
+  TransposeBase<value_t> *test = nullptr;
 
-#ifdef TRANSPOSE_SERIAL
-  TransposeSerial<value_t> test(dim);
-#endif
-#ifdef TRANSPOSE_THREADS
-  TransposeThreads<value_t> test(dim);
-#endif
-#ifdef TRANSPOSE_ALL2ALL_THREADS
-  TransposeAll2AllThreads<value_t> test(dim);
-#endif
+  switch(p_mode){
+    case 0:
+      tag = "TP_Seiral";
+      test = new TransposeSerial<value_t>(dim);
+      break;
+    case 1:
+      tag = "TP_ PutSerial";
+      test = new TransposePutSerial<value_t>(dim);
+      break;
+    case 2:
+      tag = "TP_Threads";
+      test = new TransposeThreads<value_t>(dim);
+      break;
+    case 3:
+      tag = "TP_A2AThreads";
+      test =  new TransposeAll2AllThreads<value_t>(dim);
+      break;
+    case 4:
+      tag = "TP_A2AOMP";
+      omp_set_num_threads(devices.size());
+      test = new TransposeAll2AllOMP<value_t>(dim);
+      break;
+    default:
+      std::cerr << "Not a valid transpose method. Select 0-4" << std::endl;
+      return 0;
+  }
 
   if (nreps == 0) {
-    test.check();
+    test->check();
   } else {
-    test.compute();
+    test->compute();
     double elapsed = 0;
     for (int iter = 0; iter < nreps; ++iter) {
       auto begin = std::chrono::steady_clock::now();
-      test.compute();
+      test->compute();
       auto end = std::chrono::steady_clock::now();
       if(iter) 
         elapsed += std::chrono::duration<double>(end - begin).count();
@@ -331,8 +489,10 @@ int main(int argc, char *argv[]) {
 
     std::size_t volume = dim * dim * dim * sizeof(value_t) * 2;
     double t_avg = elapsed / (nreps - 1);
-    fmt::print("transpose {0} AvgTime {1:.3f} GB/s {2:.3f}\n", dim, t_avg, volume/t_avg*1e-9);
+    fmt::print("{3} {0} {4} AvgTime {1:.3f} GB/s {2:.3f}\n", dim, t_avg, volume/t_avg*1e-9, tag, ranks);
   }
+
+  delete test;
 
   return 0;
 }
