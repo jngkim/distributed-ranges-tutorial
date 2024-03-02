@@ -284,13 +284,14 @@ int main(int argc, char *argv[]) {
     }
 
     std::size_t volume = dim * dim * sizeof(value_t);
+    //volume per exchange
     double vol = static_cast<double>(volume/ranks/ranks);
 
     auto project_time = [vol,ranks]() {
-      double bw_loc = 520;
-      double bw_mdfi = 150; //220;
-      double bw_xe = 18.5;    //56/2; // read or write
-      double t = vol/bw_loc;
+      double bw_loc = 1055;
+      double bw_mdfi = 183; //220;
+      double bw_xe = 19;    //56/2
+      double t = vol * (ranks+1) /bw_loc; // write(ranks) + read(1)
       if(ranks > 1)
         t += vol * ( (ranks - 2)/bw_xe + ranks/2/bw_mdfi);
       return t*1e-9;
@@ -298,7 +299,8 @@ int main(int argc, char *argv[]) {
 
     double t_avg = elapsed / (nreps - 1);
     double t_proj = project_time();
-    fmt::print("{3} {0} {4} AvgTime {1:.6f} {5:.6f} GB/s {2:.3f}\n", dim, t_avg, volume/t_avg*1e-9, tag, ranks, t_proj);
+    fmt::print("{3} {0} {4} AvgTime {1:.6f} {5:.6f} GB/s {2:.3f}\n",
+        dim, t_avg, 2 * volume/t_avg*1e-9, tag, ranks, t_proj);
   }
 
   delete test;
