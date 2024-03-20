@@ -56,10 +56,10 @@ void init_matrix_3d(dr::shp::distributed_dense_matrix<std::complex<T>> &m,
 }
 
 template <typename T1, typename T2>
-sycl::event transpose_tile(std::size_t m, std::size_t n, T1 in, std::size_t lda,
+sycl::event transpose_tile(sycl::queue& q,
+                           std::size_t m, std::size_t n, T1 in, std::size_t lda,
                            T2 out, std::size_t ldb,
                            const std::vector<sycl::event> &events = {}) {
-  auto &&q = dr::shp::__detail::get_queue_for_pointer(out);
   constexpr std::size_t tile_size = 16;
   const std::size_t m_max = ((m + tile_size - 1) / tile_size) * tile_size;
   const std::size_t n_max = ((n + tile_size - 1) / tile_size) * tile_size;
@@ -102,11 +102,12 @@ void transpose_matrix(dr::shp::distributed_dense_matrix<T> &i_mat,
   int m_local = i_mat.shape()[0] / ntiles;
   int n_local = o_mat.shape()[0] / ntiles;
   for (int i = 0; i < ntiles; i++) {
+    auto &&q = dr::shp::__detail::queue(i);
     for (int j_ = 0; j_ < ntiles; j_++) {
       int j = (j_ + i) % ntiles;
       auto &&send_tile = i_mat.tile({i, 0});
       auto &&recv_tile = o_mat.tile({j, 0});
-      auto e = transpose_tile(m_local, n_local, send_tile.data() + j * n_local,
+      auto e = transpose_tile(q, m_local, n_local, send_tile.data() + j * n_local,
                               lda, recv_tile.data() + i * m_local, ldb);
       events.push_back(e);
     }
@@ -166,11 +167,12 @@ template <typename T> class distributed_fft {
         int m_local = i_mat.shape()[0] / ntiles;
         int n_local = o_mat.shape()[0] / ntiles;
 
+        auto &&q = dr::shp::__detail::queue(i);
         std::vector<sycl::event> events;
         for (int j_ = 0; j_ < ntiles; j_++) {
           int j = (j_ + i) % ntiles;
           auto &&recv_tile = o_mat.tile({j, 0});
-          auto e = transpose_tile(m_local, n_local, atile.data() + j * n_local,
+          auto e = transpose_tile(q, m_local, n_local, atile.data() + j * n_local,
                                   lda, recv_tile.data() + i * m_local, ldb);
           events.push_back(e);
         }
@@ -206,12 +208,12 @@ template <typename T> class distributed_fft {
         int ldb = o_mat.shape()[1];
         int m_local = i_mat.shape()[0] / ntiles;
         int n_local = o_mat.shape()[0] / ntiles;
-
+        auto &&q = dr::shp::__detail::queue(i);
         std::vector<sycl::event> events;
         for (int j_ = 0; j_ < ntiles; j_++) {
           int j = (j_ + i) % ntiles;
           auto &&recv_tile = o_mat.tile({j, 0});
-          auto e = transpose_tile(m_local, n_local, atile.data() + j * n_local,
+          auto e = transpose_tile(q, m_local, n_local, atile.data() + j * n_local,
                                   lda, recv_tile.data() + i * m_local, ldb);
           events.push_back(e);
         }
@@ -260,9 +262,11 @@ public:
                     {dr::shp::nprocs(), 1}),
         in_({m_, n_}, row_blocks_), out_({n_, m_}, row_blocks_) {
     auto nprocs = dr::shp::nprocs();
-    fft_plans.reserve(2 * nprocs);
+    //fft_plans.reserve(2 * nprocs);
+    fft_plans.resize(2 * nprocs, nullptr);
 
     int m_local = m_ / nprocs;
+#pragma omp parallel for
     for (int i = 0; i < nprocs; i++) {
       auto &&q = dr::shp::__detail::queue(i);
       fft_plan_t *desc = new fft_plan_t({m_, m_});
@@ -274,7 +278,8 @@ public:
                       (1.0 / (m_ * m_ * m_)));
       // show_plan("yz", desc);
       desc->commit(q);
-      fft_plans.emplace_back(desc);
+      fft_plans[2*i] = desc;
+      //fft_plans.emplace_back(desc);
 
       desc = new fft_plan_t(m_);
       desc->set_value(oneapi::mkl::dft::config_param::NUMBER_OF_TRANSFORMS,
@@ -283,7 +288,8 @@ public:
       desc->set_value(oneapi::mkl::dft::config_param::BWD_DISTANCE, m_);
       // show_plan("x", desc);
       desc->commit(q);
-      fft_plans.emplace_back(desc);
+      //fft_plans.emplace_back(desc);
+      fft_plans[2*i+1] = desc;
     }
 
     fmt::print("Initializing...\n");
@@ -387,6 +393,9 @@ int main(int argc, char *argv[]) {
   std::size_t nreps = options["repetitions"].as<std::size_t>();
 
   int p_mode = options["p"].as<int>();
+  std::string p_name("FFT3D-serial");
+  if(p_mode == USE_THREADS) p_name="FFT3D-threads";
+  if(p_mode == USE_OPENMP) p_name="FFT3D-omp";
 
   auto devices = dr::shp::get_numa_devices(sycl::default_selector_v);
   std::size_t ranks = options["num-devices"].as<std::size_t>();
@@ -407,19 +416,17 @@ int main(int argc, char *argv[]) {
     fft3d.check();
   } else {
     fft3d.compute(p_mode);
-    double elapsed = 0;
+    auto begin = std::chrono::steady_clock::now();
     for (int iter = 0; iter < nreps; ++iter) {
-      auto begin = std::chrono::steady_clock::now();
       fft3d.compute(p_mode);
-      auto end = std::chrono::steady_clock::now();
-      if(iter) 
-        elapsed += std::chrono::duration<double>(end - begin).count();
     }
+    auto end = std::chrono::steady_clock::now();
+    double elapsed = std::chrono::duration<double>(end - begin).count();
 
     std::size_t volume = dim * dim * dim;
     std::size_t fft_flops =  2 * static_cast<std::size_t>(5. * volume * std::log2(static_cast<double>(volume)));
-    double t_avg = elapsed / (nreps - 1);
-    fmt::print("fft3d-shp-{3} {0} {4} AvgTime {1:.3f} GFLOPS {2:.3f}\n", dim, t_avg, fft_flops/t_avg*1e-9, p_mode, ranks);
+    double t_avg = elapsed / nreps;
+    fmt::print("{0} {1} {2} {3:.3f} sec/call {4:.3f} GFLOPS\n", p_name, dim, ranks, t_avg, fft_flops/t_avg*1e-9);
 
   }
 

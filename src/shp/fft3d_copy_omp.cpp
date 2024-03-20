@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: BSD-3-Clause
 
+#include "cxxopts.hpp"
 #include "oneapi/mkl/dfti.hpp"
 #include <dr/shp.hpp>
 #include <fmt/core.h>
@@ -86,39 +87,37 @@ template <typename T> class distributed_fft {
       std::vector<sycl::event> events;
       {
         auto &&packed_tile = o_mat.tile({i, 0});
-        for (std::size_t j_ = 0; j_ < nprocs; j_++)
-        {
+        auto e0 = fft::transpose(m_local, n_local, atile.data(), lda, packed_tile.data(), ldb);
+        events.emplace_back(e0);
+        for (std::size_t j_ = 1; j_ < nprocs; j_++) {
           std::size_t j = (j_ + i) % std::size_t(nprocs);
           auto e = fft::copy_2d(m_local, n_local, atile.data() + j * n_local, lda, packed_tile.data() + j * block_size, n_local);
-          events.push_back(e);
+          events.emplace_back(e);
         }
       }
       sycl::event::wait(events);
       events.clear();
 #pragma omp barrier
       //copy Out_i(j,blocksize) -> remote In_j(i, blocksize)
-      for (std::size_t j_ = 0; j_ < nprocs; j_++)
-      {
+      for (std::size_t j_ = 1; j_ < nprocs; j_++) {
         std::size_t j = (j_ + i) % std::size_t(nprocs);
         auto &&send_tile = o_mat.tile({i, 0});
         auto &&recv_tile = i_mat.tile({j, 0});
         auto e = dr::shp::copy_async(send_tile.data() + j*block_size, send_tile.data() + (j+1)*block_size, 
             recv_tile.data() + i*block_size);
-        events.push_back(e);
+        events.emplace_back(e);
       }
       sycl::event::wait(events);
       events.clear();
 
       //unpack (transpose) In(nproc,blocksize) -> Out(n_local, ldb)
       auto &&btile = o_mat.tile({i, 0}); // local tile (n_local, ldb)
-      for (std::size_t j_ = 0; j_ < nprocs; j_++)
-      {
+      for (std::size_t j_ = 1; j_ < nprocs; j_++) {
         std::size_t j = (j_ + i) % std::size_t(nprocs);
         auto &&unpacked_tile = i_mat.tile({i, 0});
         auto e = fft::transpose(m_local, n_local, unpacked_tile.data() + j * block_size, n_local, btile.data() + j * m_local, ldb);
-        events.push_back(e);
+        events.emplace_back(e);
       }
-      //sycl::event::wait(events);
 
       //FFT on Out in-place
       if(forward)
@@ -131,10 +130,11 @@ template <typename T> class distributed_fft {
 
 public:
   explicit distributed_fft(std::int64_t m, int nprocs) {
-    fft_yz_plans.reserve(nprocs);
-    fft_x_plans.reserve(nprocs);
+    fft_yz_plans.resize(nprocs, nullptr);
+    fft_x_plans.resize(nprocs, nullptr);
 
     int m_local = m / nprocs;
+#pragma omp parallel for
     for (int i = 0; i < nprocs; i++) {
       auto &&q = dr::shp::__detail::queue(i);
       fft_plan_t *desc = new fft_plan_t({m, m});
@@ -145,7 +145,7 @@ public:
       desc->set_value(oneapi::mkl::dft::config_param::BACKWARD_SCALE,
                       (1.0 / (m * m * m)));
       desc->commit(q);
-      fft_yz_plans.emplace_back(desc);
+      fft_yz_plans[i] = desc;
 
       desc = new fft_plan_t(m);
       desc->set_value(oneapi::mkl::dft::config_param::NUMBER_OF_TRANSFORMS,
@@ -153,7 +153,7 @@ public:
       desc->set_value(oneapi::mkl::dft::config_param::FWD_DISTANCE, m);
       desc->set_value(oneapi::mkl::dft::config_param::BWD_DISTANCE, m);
       desc->commit(q);
-      fft_x_plans.emplace_back(desc);
+      fft_x_plans[i] = desc;
     }
   }
 
@@ -183,24 +183,47 @@ public:
 } // namespace fft
 
 int main(int argc, char **argv) {
+
+  cxxopts::Options options_spec(argv[0], "fft3d");
+  // clang-format off
+  options_spec.add_options()
+    ("d, num-devices", "number of sycl devices, 0 uses all available devices", cxxopts::value<std::size_t>()->default_value("0"))
+    ("n", "problem size", cxxopts::value<std::size_t>()->default_value("8"))
+    ("p, parallel", "host 0:serial, 1:threads, 2:openmp", cxxopts::value<int>()->default_value("0"))
+    ("r,repetitions", "Number of repetitions", cxxopts::value<std::size_t>()->default_value("0"))
+    ("log", "enable logging")
+    ("logprefix", "appended .RANK.log", cxxopts::value<std::string>()->default_value("dr"))
+    ("verbose", "verbose output")
+    ("h,help", "Print help");
+  // clang-format on
+
+  cxxopts::ParseResult options;
+  try {
+    options = options_spec.parse(argc, argv);
+  } catch (const cxxopts::OptionParseException &e) {
+    std::cout << options_spec.help() << "\n";
+    exit(1);
+  }
+
+  // 512^3 up to 3072
+  std::size_t dim = options["n"].as<std::size_t>();
+  std::size_t nreps = options["repetitions"].as<std::size_t>();
+
   auto devices = dr::shp::get_numa_devices(sycl::default_selector_v);
+  std::size_t nprocs = options["num-devices"].as<std::size_t>();
+  if (nprocs != 0 && nprocs < devices.size()) {
+    devices.resize(nprocs);
+  }
+  //for (auto device : devices) {
+  //  fmt::print("Device: {}\n", device.get_info<sycl::info::device::name>());
+  //}
   dr::shp::init(devices);
 
-
-  std::size_t nprocs = dr::shp::nprocs();
-  std::size_t m_in = 64 * 12;
-  if (argc >= 2) {
-    m_in = std::atoll(argv[1]);
-  }
-  int nreps = 0;
-  if (argc == 3) {
-    nreps = std::atoi(argv[2]);
-  }
-  std::size_t m_local = (m_in + nprocs - 1) / nprocs;
+  std::size_t m_local = (dim + nprocs - 1) / nprocs;
   std::size_t m = nprocs * m_local;
   std::size_t n = m * m;
 
-  using real_t = double;
+  using real_t = float;
   using value_t = std::complex<real_t>;
   if (n * m_local * sizeof(value_t) * 1e-9 > 18.0) {
     fmt::print("Too big: reduce problem size  \n");
@@ -209,7 +232,7 @@ int main(int argc, char **argv) {
 
   omp_set_num_threads(nprocs);
 
-  fmt::print("Dims {}^3 -> {}^3, Transfer size {} GB \n", m_in, m,
+  fmt::print("Dims {}^3 -> {}^3, Transfer size {} GB \n", dim, m,
              sizeof(value_t) * m * n * 1e-9);
 
   fmt::print("Allocating...\n");
@@ -263,10 +286,10 @@ int main(int argc, char **argv) {
     double fft_gbytes = 2.0 * volume  *  sizeof(value_t) * 1e-9;
     double fft_gflops = 5. * volume * std::log2(volume) *  1e-9;
 
-    double duration = (for_timers[nreps/2] + back_timers[nreps/2])/2.0;
+    double duration = (for_timers[nreps/2] + back_timers[nreps/2]);
     fmt::print("Type n tiles GFLOPS GB/sec secs\n");
-    fmt::print("FFT_copy_omp {} {} {:.3f} {:.3f} {:.6f}\n", m, nprocs, 
-        fft_gflops/duration, fft_gbytes/duration, duration);
+    fmt::print("{0} {1} {2} {3:.3f} sec/call {4:.3f} GFLOPS {5:.3f} GB/s\n", 
+        "FFT3D_copy_omp", dim, nprocs, duration, 2*fft_gflops/duration, 2*fft_gbytes/duration);
   }
 
 
